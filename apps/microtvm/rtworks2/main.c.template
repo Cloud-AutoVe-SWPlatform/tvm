@@ -1,0 +1,91 @@
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/time.h>
+
+#include <tvm/runtime/c_runtime_api.h>
+#include <tvm/runtime/crt/logging.h>
+#include <tvm/runtime/crt/module.h>
+#include <tvm/runtime/crt/platform.h>
+#include <tvm/runtime/crt/stack_allocator.h>
+#include <tvmgen_default.h>
+
+#include "inputs.h"
+#include "outputs.h"
+#include "labels.h"
+
+static uint8_t g_crt_workspace[TVMGEN_DEFAULT_WORKSPACE_SIZE + 256];
+static tvm_workspace_t app_workspace;
+
+static struct timeval tv;
+static double start, end;
+
+void TVMLogf(const char* msg, ...) {
+  va_list args;
+  va_start(args, msg);
+  (void)vfprintf(stderr, msg, args);
+  va_end(args);
+}
+
+void __attribute__((noreturn)) TVMPlatformAbort(tvm_crt_error_t error_code) {
+  (void)fprintf(stderr, "TVMPlatformAbort: %d\n", error_code);
+  exit(-1);
+}
+
+tvm_crt_error_t TVMPlatformMemoryAllocate(size_t num_bytes, DLDevice dev, void** out_ptr) {
+  return StackMemoryManager_Allocate(&app_workspace, num_bytes, out_ptr);
+}
+
+tvm_crt_error_t TVMPlatformMemoryFree(void* ptr, DLDevice dev) {
+  return StackMemoryManager_Free(&app_workspace, ptr);
+}
+
+tvm_crt_error_t TVMPlatformTimerStart(void) {
+  if (gettimeofday(&tv, NULL) == 0) {
+    start = (tv.tv_sec) * 1000 + (tv.tv_usec) / 1000;
+    return kTvmErrorNoError;
+  }
+  return kTvmErrorPlatformTimerBadState;
+}
+
+tvm_crt_error_t TVMPlatformTimerStop(double *elapsed_time_seconds) {
+  if (gettimeofday(&tv, NULL) == 0) {
+    end = (tv.tv_sec) * 1000 + (tv.tv_usec) / 1000;
+    *elapsed_time_seconds = (end - start) / 1000;
+    return kTvmErrorNoError;
+  }
+  return kTvmErrorPlatformTimerBadState;
+}
+
+const TVMModule* TVMSystemLibEntryPoint(void) { return NULL; }
+
+int main(void) {
+  (void)StackMemoryManager_Init(&app_workspace, g_crt_workspace, TVMGEN_DEFAULT_WORKSPACE_SIZE + 256);
+
+  struct tvmgen_default_inputs inputs = {.input = input_storage};
+  struct tvmgen_default_outputs outputs = {.output = output_storage};
+
+  double elapsed_time_seconds = 0;
+  while (1) {
+    TVMPlatformTimerStart();
+    if (tvmgen_default_run(&inputs, &outputs) != 0) {
+      (void)printf("Model run failed\n");
+      return -1;
+    }
+    TVMPlatformTimerStop(&elapsed_time_seconds);
+    printf("Inference time: %lf seconds\n", elapsed_time_seconds);
+
+    // Calculate index of max value
+    float max_value = 0.0;
+    size_t max_index = -1;
+    for (unsigned int i = 0; i < output_len; ++i) {
+      if (output_storage[i] > max_value) {
+        max_value = output_storage[i];
+        max_index = i;
+      }
+    }
+    (void)printf("The result is '%s'!\n", labels[max_index]);
+  }
+
+  return 0;
+}
