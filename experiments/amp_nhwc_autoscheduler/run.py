@@ -105,7 +105,7 @@ if __name__ == "__main__":
 
             tuner = auto_scheduler.TaskScheduler(tasks, task_weights)
             tune_option = auto_scheduler.TuningOptions(
-                num_measure_trials=20000,
+                num_measure_trials=len(tasks) * 750,
                 builder=auto_scheduler.LocalBuilder(timeout=60),
                 runner=remote_runner,
                 measure_callbacks=[auto_scheduler.RecordToFile(log_file)],
