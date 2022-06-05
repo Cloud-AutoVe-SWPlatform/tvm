@@ -103,7 +103,7 @@ if __name__ == "__main__":
                 key=device_key, host=host, port=port, repeat=1, min_repeat_ms=300, timeout=600
             )
 
-            tuner = auto_scheduler.TaskScheduler(tasks, task_weights, strategy='round-robin')
+            tuner = auto_scheduler.TaskScheduler(tasks, task_weights, strategy='round-robin', load_log_file=log_file)
             tune_option = auto_scheduler.TuningOptions(
                 num_measure_trials=len(tasks) * 2000,
                 builder=auto_scheduler.LocalBuilder(timeout=60),
