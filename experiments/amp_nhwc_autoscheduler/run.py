@@ -30,7 +30,7 @@ def tvm_amp(mod, params, to_nhwc=False):
     mod = tvm.relay.transform.ToMixedPrecision()(mod)
 
     if to_nhwc:
-        desired_layouts = {"nn.conv2d": ["NHWC", "default"], "qnn.conv2d": ["NHWC", "default"]}
+        desired_layouts = {k: ["NHWC", "default"] for k in ["nn.conv2d", "nn.max_pool2d", "qnn.conv2d"]}
         mod = relay.transform.ConvertLayout(desired_layouts)(mod)
 
     mod = tvm.relay.transform.EliminateCommonSubexpr()(mod)
