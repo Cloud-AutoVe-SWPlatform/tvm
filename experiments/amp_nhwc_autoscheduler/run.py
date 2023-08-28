@@ -70,7 +70,7 @@ if __name__ == "__main__":
         torch_model = (
             timm.create_model("tf_efficientnetv2_s", pretrained=True)
             if FLAGS.model == "efficientnet_v2_s"
-            else getattr(torchvision.models, FLAGS.model)(pretrained=True)
+            else getattr(torchvision.models, FLAGS.model)(weights="DEFAULT")
         )
         torch_model.eval()
         scripted_torch_model = torch.jit.trace(torch_model, torch.randn(data.shape)).eval()
