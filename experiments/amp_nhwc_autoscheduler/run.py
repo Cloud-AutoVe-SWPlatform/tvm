@@ -1,5 +1,6 @@
 import os
 from copy import deepcopy
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -17,6 +18,7 @@ from tvm.contrib.download import download_testdata
 
 FLAGS = flags.FLAGS
 
+flags.DEFINE_bool("cached", True, "Use cached model.")
 flags.DEFINE_enum("backend", "opencv_cpu", ["opencv_cpu", "tvm_gpu"], "Choose backend.")
 flags.DEFINE_enum(
     "model", "mobilenet_v2", ["mobilenet_v2", "resnet50", "efficientnet_v2_s"], "Choose model."
@@ -80,24 +82,24 @@ def main(_):
     with open(synset_path) as f:
         synset = eval(f.read())
 
-    # Prepare model
-    torch_model = (
-        timm.create_model("tf_efficientnetv2_s", pretrained=True)
-        if FLAGS.model == "efficientnet_v2_s"
-        else getattr(torchvision.models, FLAGS.model)(weights="DEFAULT")
-    )
-    torch_model.eval()
-
     dummy_input = torch.randn(data.shape)
     input_name = "input_1"
     repeat = 50
 
     if FLAGS.backend == "opencv_cpu":
-        onnx_file = f"{FLAGS.model}.onnx"
-        torch.onnx.export(
-            torch_model, dummy_input, onnx_file, input_names=[input_name], opset_version=11
-        )
-        opencv_net = cv2.dnn.readNetFromONNX(onnx_file)
+        # Prepare model
+        onnx_file = Path(f"{FLAGS.model}.onnx")
+        if not (FLAGS.cached and onnx_file.exists()):
+            torch_model = (
+                timm.create_model("tf_efficientnetv2_s", pretrained=True)
+                if FLAGS.model == "efficientnet_v2_s"
+                else getattr(torchvision.models, FLAGS.model)(weights="DEFAULT")
+            )
+            torch_model.eval()
+            torch.onnx.export(
+                torch_model, dummy_input, onnx_file, input_names=[input_name], opset_version=11
+            )
+        opencv_net = cv2.dnn.readNetFromONNX(str(onnx_file))
         opencv_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
         opencv_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         opencv_net.setInput(data)
@@ -116,21 +118,33 @@ def main(_):
         top1_opencv = np.argmax(opencv_out)
         print(f"OpenCV top-1 id: {top1_opencv}, class name: {synset[top1_opencv]}")
     else:
-        scripted_torch_model = torch.jit.trace(torch_model, dummy_input).eval()
-        shape_list = [(input_name, data.shape)]
-        mod, params = relay.frontend.from_pytorch(scripted_torch_model, shape_list)
-        mod = tvm_amp(mod, params, to_nhwc=True)
-        params = None
-
-        # Compile with the history best
-        log_file = f"{FLAGS.model}.json"
+        # Prepare model
+        lib_file = Path(f"{FLAGS.model}.tar")
         target = tvm.target.Target("cuda -arch=sm_72", host="llvm -mcpu=carmel")
-        print("Compile...")
-        with auto_scheduler.ApplyHistoryBest(log_file):
-            with tvm.transform.PassContext(
-                opt_level=3, config={"relay.backend.use_auto_scheduler": True}
-            ):
-                lib = relay.build(mod, target=target)
+        if not (FLAGS.cached and lib_file.exists()):
+            torch_model = (
+                timm.create_model("tf_efficientnetv2_s", pretrained=True)
+                if FLAGS.model == "efficientnet_v2_s"
+                else getattr(torchvision.models, FLAGS.model)(weights="DEFAULT")
+            )
+            torch_model.eval()
+
+            scripted_torch_model = torch.jit.trace(torch_model, dummy_input).eval()
+            shape_list = [(input_name, data.shape)]
+            mod, params = relay.frontend.from_pytorch(scripted_torch_model, shape_list)
+            mod = tvm_amp(mod, params, to_nhwc=True)
+            params = None
+
+            # Compile with the history best
+            log_file = f"{FLAGS.model}.json"
+            print("Compile...")
+            with auto_scheduler.ApplyHistoryBest(log_file):
+                with tvm.transform.PassContext(
+                    opt_level=3, config={"relay.backend.use_auto_scheduler": True}
+                ):
+                    lib = relay.build(mod, target=target)
+            lib.export_library(lib_file)
+        lib = tvm.runtime.load_module(lib_file)
 
         # Create graph executor
         dev = tvm.device(str(target))
