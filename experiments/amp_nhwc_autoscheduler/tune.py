@@ -1,7 +1,6 @@
 import os
 from copy import deepcopy
 
-import cv2
 import numpy as np
 import timm
 import torch
@@ -86,34 +85,68 @@ def main(_):
         else getattr(torchvision.models, FLAGS.model)(weights="DEFAULT")
     )
     torch_model.eval()
-
-    dummy_input = torch.randn(data.shape)
-    scripted_torch_model = torch.jit.trace(torch_model, dummy_input).eval()
+    scripted_torch_model = torch.jit.trace(torch_model, torch.randn(data.shape)).eval()
     input_name = "input_1"
     shape_list = [(input_name, data.shape)]
     mod, params = relay.frontend.from_pytorch(scripted_torch_model, shape_list)
     mod = tvm_amp(mod, params, to_nhwc=True)
     params = None
 
-    onnx_file = f"{FLAGS.model}.onnx"
-    torch.onnx.export(torch_model, dummy_input, onnx_file, input_names=[input_name])
-    opencv_net = cv2.dnn.readNetFromONNX(onnx_file)
-    opencv_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    opencv_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    opencv_net.setInput(data)
+    # Extract tasks from the network
+    target = tvm.target.Target(
+        "cuda -arch=sm_72", host="llvm -mtriple=aarch64-linux-gnu -mcpu=carmel"
+    )
+    device_key = "xavier"
+    host = "0.0.0.0"
+    port = 9190
+    log_file = f"{FLAGS.model}.json"
+
+    print("Extract tasks...")
+    tasks, task_weights = auto_scheduler.extract_tasks(deepcopy(mod), params, target)
+
+    for idx, task in enumerate(tasks):
+        print("========== Task %d  (workload key: %s) ==========" % (idx, task.workload_key))
+        print(task.compute_dag)
+
+    def run_tuning():
+        print("Begin tuning...")
+        remote_runner = auto_scheduler.RPCRunner(
+            key=device_key, host=host, port=port, repeat=1, min_repeat_ms=300, timeout=600
+        )
+
+        tuner = auto_scheduler.TaskScheduler(
+            tasks, task_weights, strategy="round-robin", load_log_file=log_file
+        )
+        tune_option = auto_scheduler.TuningOptions(
+            num_measure_trials=len(tasks) * 2000,
+            builder=auto_scheduler.LocalBuilder(timeout=60),
+            runner=remote_runner,
+            measure_callbacks=[auto_scheduler.RecordToFile(log_file)],
+        )
+
+        tuner.tune(tune_option, per_task_early_stopping=600)
+
+    run_tuning()
 
     # Compile with the history best
-    log_file = f"{FLAGS.model}.json"
-    target = tvm.target.Target("cuda -arch=sm_72", host="llvm -mcpu=carmel")
     print("Compile...")
     with auto_scheduler.ApplyHistoryBest(log_file):
         with tvm.transform.PassContext(
             opt_level=3, config={"relay.backend.use_auto_scheduler": True}
         ):
             lib = relay.build(mod, target=target)
+    lib_file = f"{FLAGS.model}.tar"
+    lib.export_library(lib_file)
+
+    remote = tvm.auto_scheduler.utils.request_remote(
+        device_key=device_key, host=host, port=port, timeout=180
+    )
+    dev = remote.device(str(target))
+
+    remote.upload(lib_file)
+    lib = remote.load_module(lib_file)
 
     # Create graph executor
-    dev = str(target)
     module = graph_executor.GraphModule(lib["default"](dev))
     dtype = "float32"
     data_tvm = tvm.nd.array(data.astype(dtype))
@@ -121,29 +154,24 @@ def main(_):
 
     # Evaluate
     print("Evaluate inference time cost...")
-    repeat = 50
-    ftimer = module.module.time_evaluator("run", dev, repeat=repeat)
-    tvm_prof_res = np.array(ftimer().results) * 1e3  # convert to millisecond
-    print(
-        f"Relay Mean inference time (std dev): {np.mean(tvm_prof_res):.2f} ms ({np.std(tvm_prof_res):.2f} ms)"
-    )
+    ftimer = module.module.time_evaluator("run", dev, repeat=50)
+    prof_res = np.array(ftimer().results) * 1e3  # convert to millisecond
+    print(f"Mean inference time (std dev): {np.mean(prof_res):.2f} ms ({np.std(prof_res):.2f} ms)")
+
     module.run()
     tvm_out = module.get_output(0)
     top1_tvm = np.argmax(tvm_out.asnumpy())
-    print(f"Relay top-1 id: {top1_tvm}, class name: {synset[top1_tvm]}")
 
-    cv2.setNumThreads(1)
-    opencv_prof_res = []
-    opencv_out = opencv_net.forward()
-    for _ in range(repeat):
-        opencv_net.forward()
-        opencv_prof_res.append(opencv_net.getPerfProfile()[0])
-    opencv_prof_res = np.array(opencv_prof_res) * 1000.0 / cv2.getTickFrequency()
-    print(
-        f"OpenCV Mean inference time (std dev): {np.mean(opencv_prof_res):.2f} ms ({np.std(opencv_prof_res):.2f} ms)"
-    )
-    top1_opencv = np.argmax(opencv_out)
-    print(f"OpenCV top-1 id: {top1_opencv}, class name: {synset[top1_opencv]}")
+    print(f"Relay top-1 id: {top1_tvm}, class name: {synset[top1_tvm]}")
+    # confirm correctness with torch output
+    with torch.no_grad():
+        torch_img = torch.from_numpy(data)
+        output = torch_model(torch_img)
+
+        # Get top-1 result for PyTorch
+        top1_torch = np.argmax(output.numpy())
+
+    print(f"Torch top-1 id: {top1_torch}, class name: {synset[top1_torch]}")
 
 
 if __name__ == "__main__":
