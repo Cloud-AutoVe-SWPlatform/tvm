@@ -51,3 +51,12 @@ We learned a lot from the following projects when building TVM.
   originates from Halide. We also learned and adapted some part of lowering pipeline from Halide.
 - [Loopy](https://github.com/inducer/loopy): use of integer set analysis and its loop transformation primitives.
 - [Theano](https://github.com/Theano/Theano): the design inspiration of symbolic scan operator for recurrence.
+
+---
+
+Contributors
+-------------------------------------------
+- Daewoo Lee (dwlee@rtst.co.kr)
+- Minhae Ye (wiz.sensitive@rtst.co.kr)
+- Myungkyung Lee (myungkyung_lee@rtst.co.kr)
+- Ikhee Shin (ihshin@rtst.co.kr)
